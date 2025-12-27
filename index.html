@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Magnet Dash</title>
+
+  <!-- Poki SDK (allowed on Poki). Keep NO other external requests. -->
+  <script src="https://game-cdn.poki.com/scripts/v2/poki-sdk.js"></script>
+
+  <style>
+    :root { --bg:#0b1020; --fg:#eaf0ff; --muted:#9aa6c3; }
+    html,body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,Segoe UI,Roboto,Arial; }
+    #wrap { height:100%; display:flex; align-items:center; justify-content:center; }
+    canvas { width:100vw; height:100vh; display:block; touch-action:none; }
+    .hud {
+      position:fixed; left:0; top:0; width:100%; pointer-events:none;
+      display:flex; justify-content:space-between; padding:12px;
+      box-sizing:border-box; font-weight:700; text-shadow:0 2px 10px rgba(0,0,0,.6);
+    }
+    .pill { pointer-events:auto; background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.12);
+      border-radius:999px; padding:8px 12px; display:flex; gap:10px; align-items:center;
+      backdrop-filter: blur(6px);
+    }
+    button {
+      pointer-events:auto;
+      border:1px solid rgba(255,255,255,.18);
+      background:rgba(255,255,255,.08);
+      color:var(--fg);
+      border-radius:12px;
+      padding:10px 12px;
+      font-weight:800;
+      cursor:pointer;
+    }
+    button:active { transform: translateY(1px); }
+    #centerPanel {
+      position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+      pointer-events:none;
+    }
+    .card {
+      pointer-events:auto;
+      width:min(520px, 92vw);
+      background:rgba(0,0,0,.45);
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:18px;
+      padding:18px;
+      box-shadow: 0 20px 80px rgba(0,0,0,.55);
+      backdrop-filter: blur(10px);
+    }
+    .title { font-size:24px; margin:0 0 8px; }
+    .sub { margin:0 0 14px; color:var(--muted); font-weight:600; line-height:1.35; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; }
+    .hint { margin-top:12px; color:var(--muted); font-weight:600; font-size:13px; }
+    .small { font-size:12px; color:var(--muted); font-weight:700; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="c"></canvas>
+  </div>
+
+  <div class="hud">
+    <div class="pill" id="leftHud">
+      <span id="score">Score: 0</span>
+      <span class="small" id="coins">Coins: 0</span>
+      <span class="small" id="lvl">Lv 1</span>
+    </div>
+    <div class="pill">
+      <button id="soundBtn" aria-label="Toggle Sound">🔊 Sound</button>
+    </div>
+  </div>
+
+  <div id="centerPanel">
+    <div class="card" id="card">
+      <h1 class="title" id="cardTitle">Magnet Dash</h1>
+      <p class="sub" id="cardSub">
+        Drag with one finger to move. Collect coins. Avoid spikes. Levels get faster.
+      </p>
+      <div class="row" id="cardButtons">
+        <button id="playBtn">▶ Play</button>
+      </div>
+      <div class="hint" id="hint">
+        Tip: Keep runs short & replayable — perfect for Poki.
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function(){
+    // ---------------------------
+    // Poki SDK safe wrapper
+    // ---------------------------
+    const Poki = (function(){
+      const stub = {
+        init: () => Promise.resolve(),
+        gameLoadingFinished: () => {},
+        gameplayStart: () => {},
+        gameplayStop: () => {},
+        commercialBreak: (cb) => { try{ cb && cb(); }catch{} return Promise.resolve(); },
+        rewardedBreak: (opts) => Promise.resolve(false),
+      };
+      function sdk(){ return (window.PokiSDK && typeof window.PokiSDK.init === "function") ? window.PokiSDK : stub; }
+      return {
+        init: () => sdk().init(),
+        loaded: () => sdk().gameLoadingFinished(),
+        start: () => sdk().gameplayStart(),
+        stop: () => sdk().gameplayStop(),
+        commercialBreak: (pauseFn) => sdk().commercialBreak(pauseFn),
+        rewardedBreak: (opts) => sdk().rewardedBreak(opts),
+      };
+    })();
+
+    // ---------------------------
+    // Canvas setup (virtual 16:9)
+    // Poki requires scaling to 16:9 across devices. :contentReference[oaicite:6]{index=6}
+    // ---------------------------
+    const VW = 960, VH = 540; // 16:9
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+
+    let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1)); // cap for performance
+    let cw=0, ch=0, scale=1, ox=0, oy=0;
+
+    function resize(){
+      dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      cw = Math.floor(window.innerWidth * dpr);
+      ch = Math.floor(window.innerHeight * dpr);
+      canvas.width = cw; canvas.height = ch;
+      scale = Math.min(cw / VW, ch / VH);
+      ox = (cw - VW * scale) * 0.5;
+      oy = (ch - VH * scale) * 0.5;
+    }
+    window.addEventListener('resize', resize, {passive:true});
+    resize();
+
+    function toWorld(clientX){
+      const rect = canvas.getBoundingClientRect();
+      const px = (clientX - rect.left) * dpr;
+      return (px - ox) / scale;
+    }
+
+    // ---------------------------
+    // UI
+    // ---------------------------
+    const $score = document.getElementById('score');
+    const $coins = document.getElementById('coins');
+    const $lvl = document.getElementById('lvl');
+    const $soundBtn = document.getElementById('soundBtn');
+
+    const $panel = document.getElementById('centerPanel');
+    const $card = document.getElementById('card');
+    const $title = document.getElementById('cardTitle');
+    const $sub = document.getElementById('cardSub');
+    const $btns = document.getElementById('cardButtons');
+    const $playBtn = document.getElementById('playBtn');
+
+    // Incognito safe storage: Poki notes localStorage can fail; wrap in try/catch. :contentReference[oaicite:7]{index=7}
+    const store = {
+      get(k, def){
+        try { const v = localStorage.getItem(k); return v==null?def:JSON.parse(v); } catch { return def; }
+      },
+      set(k, v){
+        try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
+      }
+    };
+    let best = store.get('md_best', 0) || 0;
+
+    // ---------------------------
+    // Audio (no external files)
+    // ---------------------------
+    let audioCtx = null;
+    let soundOn = true;
+    function ensureAudio(){
+      if(!audioCtx){
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if(audioCtx.state === "suspended") audioCtx.resume().catch(()=>{});
+    }
+    function beep(freq, dur, type="sine", vol=0.05){
+      if(!soundOn || !audioCtx) return;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(audioCtx.destination);
+      const t = audioCtx.currentTime;
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.start(t); o.stop(t + dur);
+    }
+    $soundBtn.addEventListener('click', () => {
+      soundOn = !soundOn;
+      $soundBtn.textContent = soundOn ? "🔊 Sound" : "🔇 Sound";
+      ensureAudio();
+      beep(660, 0.06, "triangle", 0.04);
+    });
+
+    // ---------------------------
+    // Game objects
+    // ---------------------------
+    const rnd = (a,b)=>a + Math.random()*(b-a);
+    const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+    const player = {
+      x: VW/2, y: VH*0.82, r: 18,
+      shield: 0,
+      magnet: 0,
+      slow: 0,
+      hurtFlash: 0,
+    };
+
+    let state = "menu"; // menu | playing | gameover
+    let tPrev = 0;
+    let score = 0;
+    let coinCount = 0;
+    let level = 1;
+    let dist = 0;
+    let speed = 260;
+    let spawnT = 0;
+    let safeT = 0; // short invulnerability after continue
+    let runId = 0;
+
+    const coins = [];
+    const obstacles = [];
+    const powerups = [];
+
+    function resetRun(){
+      player.x = VW/2;
+      player.shield = 0;
+      player.magnet = 0;
+      player.slow = 0;
+      player.hurtFlash = 0;
+      score = 0;
+      coinCount = 0;
+      level = 1;
+      dist = 0;
+      speed = 260;
+      spawnT = 0;
+      safeT = 1.0;
+      coins.length = 0;
+      obstacles.length = 0;
+      powerups.length = 0;
+      runId++;
+      updateHud();
+    }
+
+    function updateHud(){
+      $score.textContent = "Score: " + Math.floor(score);
+      $coins.textContent = "Coins: " + coinCount;
+      $lvl.textContent = "Lv " + level;
+    }
+
+    // Collision helpers
+    function circleRectCollide(cx, cy, cr, rx, ry, rw, rh){
+      const nx = clamp(cx, rx, rx+rw);
+      const ny = clamp(cy, ry, ry+rh);
+      const dx = cx - nx, dy = cy - ny;
+      return (dx*dx + dy*dy) <= cr*cr;
+    }
+    function circleCircle(cx,cy,cr, x,y,r){
+      const dx=cx-x, dy=cy-y;
+      const rr=cr+r;
+      return dx*dx+dy*dy <= rr*rr;
+    }
+
+    // Spawners
+    function spawn(){
+      // spawn at y just above screen
+      const y = -40;
+
+      // obstacle pattern
+      const pattern = Math.random();
+      if(pattern < 0.50){
+        // 1 big block with a gap
+        const gapW = rnd(220, 320) - Math.min(120, level*8);
+        const gapX = rnd(80, VW-80-gapW);
+        obstacles.push({x:0, y, w:gapX-30, h:26, t:"bar"});
+        obstacles.push({x:gapX+gapW+30, y, w:VW-(gapX+gapW+30), h:26, t:"bar"});
+        // coins through gap
+        for(let i=0;i<5;i++){
+          coins.push({x:gapX+gapW/2 + rnd(-30,30), y:y - i*22, r:9});
+        }
+      } else if(pattern < 0.80){
+        // spikes cluster
+        const count = 3 + Math.min(4, Math.floor(level/2));
+        for(let i=0;i<count;i++){
+          const w = rnd(36, 60), h = rnd(24, 32);
+          obstacles.push({x:rnd(20, VW-20-w), y:y - i*18, w, h, t:"spike"});
+        }
+        // coin trail
+        const cx = rnd(120, VW-120);
+        for(let i=0;i<7;i++){
+          coins.push({x:cx + Math.sin(i*0.7)*50, y:y - i*22, r:9});
+        }
+      } else {
+        // coin lane + occasional powerup
+        const cx = rnd(80, VW-80);
+        for(let i=0;i<10;i++){
+          coins.push({x:cx + rnd(-60,60), y:y - i*18, r:9});
+        }
+        if(Math.random() < 0.35){
+          const types = ["shield","magnet","slow"];
+          const type = types[Math.floor(Math.random()*types.length)];
+          powerups.push({x:cx, y:y-120, r:14, type});
+        }
+      }
+    }
+
+    // ---------------------------
+    // Input (one-hand drag)
+    // ---------------------------
+    let targetX = player.x;
+    let dragging = false;
+
+    function onPointerDown(e){
+      ensureAudio();
+      dragging = true;
+      targetX = clamp(toWorld(e.clientX), 24, VW-24);
+    }
+    function onPointerMove(e){
+      if(!dragging) return;
+      targetX = clamp(toWorld(e.clientX), 24, VW-24);
+    }
+    function onPointerUp(){
+      dragging = false;
+    }
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+
+    // Desktop keyboard support
+    const keys = {};
+    window.addEventListener('keydown', (e)=>{ keys[e.key]=true; if(["ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault(); });
+    window.addEventListener('keyup', (e)=>{ keys[e.key]=false; });
+
+    // ---------------------------
+    // State transitions + Poki calls
+    // ---------------------------
+    async function startGameFlow(){
+      // Poki recommends commercialBreak at natural stops, especially before gameplayStart. :contentReference[oaicite:8]{index=8}
+      await Poki.commercialBreak(()=>{ /* pause audio if needed */ });
+      resetRun();
+      state = "playing";
+      Poki.start();
+      beep(740, 0.06, "triangle", 0.05);
+      hidePanel();
+    }
+
+    function gameOver(){
+      if(state !== "playing") return;
+      state = "gameover";
+      Poki.stop();
+      beep(180, 0.14, "sawtooth", 0.06);
+      best = Math.max(best, Math.floor(score));
+      store.set('md_best', best);
+      showGameOverPanel();
+    }
+
+    function hidePanel(){ $panel.style.display = "none"; }
+    function showPanel(){ $panel.style.display = "flex"; }
+
+    function showMenuPanel(){
+      showPanel();
+      $title.textContent = "Magnet Dash";
+      $sub.textContent = "Drag with one finger to move. Collect coins. Avoid spikes. Faster levels = higher score.";
+      $btns.innerHTML = "";
+      const b = document.createElement("button");
+      b.textContent = "▶ Play";
+      b.onclick = () => startGameFlow();
+      $btns.appendChild(b);
+      const s = document.createElement("div");
+      s.className="small";
+      s.style.marginTop="10px";
+      s.textContent = "Best: " + best;
+      $btns.appendChild(s);
+    }
+
+    function showGameOverPanel(){
+      showPanel();
+      $title.textContent = "Game Over";
+      $sub.textContent = `Score: ${Math.floor(score)}  •  Coins: ${coinCount}  •  Best: ${best}`;
+      $btns.innerHTML = "";
+
+      const restart = document.createElement("button");
+      restart.textContent = "↻ Restart";
+      restart.onclick = () => startGameFlow();
+      $btns.appendChild(restart);
+
+      const cont = document.createElement("button");
+      cont.textContent = "🎁 Continue (Reward)";
+      cont.onclick = async () => {
+        // Rewarded break: only reward on success. :contentReference[oaicite:9]{index=9}
+        const success = await Poki.rewardedBreak({
+          size: "medium",
+          onStart: ()=>{ /* pause audio */ },
+        });
+        if(success){
+          // revive with shield + short invulnerability
+          player.shield = 1;
+          safeT = 1.2;
+          state = "playing";
+          Poki.start();
+          hidePanel();
+          beep(900, 0.08, "triangle", 0.06);
+        } else {
+          beep(220, 0.06, "square", 0.04);
+        }
+      };
+      $btns.appendChild(cont);
+
+      const menu = document.createElement("button");
+      menu.textContent = "🏠 Menu";
+      menu.onclick = () => { state="menu"; Poki.stop(); showMenuPanel(); };
+      $btns.appendChild(menu);
+    }
+
+    // ---------------------------
+    // Main loop
+    // ---------------------------
+    function update(dt){
+      // smoothing target
+      if(keys["ArrowLeft"]) targetX -= 520*dt;
+      if(keys["ArrowRight"]) targetX += 520*dt;
+      targetX = clamp(targetX, 24, VW-24);
+
+      player.x += (targetX - player.x) * Math.min(1, dt*12);
+
+      // timers
+      if(player.magnet>0) player.magnet = Math.max(0, player.magnet - dt);
+      if(player.slow>0) player.slow = Math.max(0, player.slow - dt);
+      if(player.hurtFlash>0) player.hurtFlash = Math.max(0, player.hurtFlash - dt);
+      if(safeT>0) safeT = Math.max(0, safeT - dt);
+
+      // scoring
+      const spdMul = (player.slow>0) ? 0.65 : 1;
+      const curSpeed = speed * spdMul;
+
+      dist += curSpeed * dt;
+      score += (curSpeed * dt) * 0.04; // distance score
+      score += coinCount * 0.0; // keep coins separate; total is distance + survival
+
+      // level up every ~1400 distance (scales with speed)
+      const newLevel = 1 + Math.floor(dist / 1400);
+      if(newLevel !== level){
+        level = newLevel;
+        speed = 260 + (level-1)*28;
+        beep(980, 0.08, "triangle", 0.06);
+      }
+
+      // spawn cadence
+      spawnT -= dt;
+      const spawnEvery = Math.max(0.42, 0.95 - level*0.03);
+      if(spawnT <= 0){
+        spawnT = spawnEvery;
+        spawn();
+      }
+
+      // move entities
+      for(let i=coins.length-1;i>=0;i--){
+        const c = coins[i];
+        c.y += curSpeed * dt;
+
+        // magnet pull
+        if(player.magnet>0){
+          const dx = player.x - c.x;
+          const dy = player.y - c.y;
+          const d2 = dx*dx + dy*dy;
+          if(d2 < 220*220){
+            c.x += dx * dt * 6.5;
+            c.y += dy * dt * 6.5;
+          }
+        }
+
+        // collect
+        if(circleCircle(player.x, player.y, player.r, c.x, c.y, c.r)){
+          coinCount++;
+          score += 18; // coin bonus
+          coins.splice(i,1);
+          beep(720, 0.04, "sine", 0.035);
+          continue;
+        }
+        // offscreen
+        if(c.y > VH + 60) coins.splice(i,1);
+      }
+
+      for(let i=powerups.length-1;i>=0;i--){
+        const p = powerups[i];
+        p.y += curSpeed * dt;
+        if(circleCircle(player.x, player.y, player.r, p.x, p.y, p.r)){
+          if(p.type==="shield"){ player.shield = 1; beep(520,0.07,"triangle",0.05); }
+          if(p.type==="magnet"){ player.magnet = 5.5; beep(820,0.07,"triangle",0.05); }
+          if(p.type==="slow"){ player.slow = 3.0; beep(360,0.07,"triangle",0.05); }
+          powerups.splice(i,1);
+          continue;
+        }
+        if(p.y > VH + 80) powerups.splice(i,1);
+      }
+
+      for(let i=obstacles.length-1;i>=0;i--){
+        const o = obstacles[i];
+        o.y += curSpeed * dt;
+        if(o.y > VH + 80){
+          obstacles.splice(i,1);
+          continue;
+        }
+        if(safeT<=0 && circleRectCollide(player.x, player.y, player.r, o.x, o.y, o.w, o.h)){
+          if(player.shield>0){
+            player.shield = 0;
+            player.hurtFlash = 0.25;
+            obstacles.splice(i,1);
+            beep(140,0.08,"square",0.06);
+          } else {
+            gameOver();
+            return;
+          }
+        }
+      }
+
+      updateHud();
+    }
+
+    function draw(){
+      // letterbox
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.fillStyle = "#070a14";
+      ctx.fillRect(0,0,cw,ch);
+
+      ctx.setTransform(scale,0,0,scale,ox,oy);
+
+      // background
+      const g = ctx.createLinearGradient(0,0,0,VH);
+      g.addColorStop(0, "#0b1020");
+      g.addColorStop(1, "#070a14");
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,VW,VH);
+
+      // subtle grid
+      ctx.globalAlpha = 0.12;
+      ctx.strokeStyle = "#9aa6c3";
+      ctx.lineWidth = 1;
+      for(let x=0;x<=VW;x+=60){
+        ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,VH); ctx.stroke();
+      }
+      for(let y=0;y<=VH;y+=60){
+        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(VW,y); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      // entities
+      // obstacles
+      for(const o of obstacles){
+        ctx.fillStyle = (o.t==="spike") ? "#ff3b5c" : "#7b5cff";
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+        // tiny shine
+        ctx.globalAlpha = 0.18;
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(o.x, o.y, o.w, 3);
+        ctx.globalAlpha = 1;
+      }
+
+      // coins
+      for(const c of coins){
+        ctx.beginPath();
+        ctx.fillStyle = "#ffd166";
+        ctx.arc(c.x, c.y, c.r, 0, Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha = 0.25;
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(c.x - c.r*0.25, c.y - c.r*0.25, c.r*0.45, 0, Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
+      // powerups
+      for(const p of powerups){
+        ctx.beginPath();
+        ctx.fillStyle = p.type==="shield" ? "#5dffb3" : (p.type==="magnet" ? "#66d9ff" : "#caa0ff");
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = "#0b1020";
+        ctx.font = "900 14px system-ui";
+        ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.fillText(p.type==="shield" ? "S" : (p.type==="magnet" ? "M" : "⏱"), p.x, p.y+1);
+      }
+
+      // player
+      // glow
+      ctx.globalAlpha = 0.25;
+      ctx.beginPath();
+      ctx.fillStyle = "#66d9ff";
+      ctx.arc(player.x, player.y, player.r*1.9, 0, Math.PI*2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // core
+      ctx.beginPath();
+      ctx.fillStyle = player.hurtFlash>0 ? "#ff3b5c" : "#66d9ff";
+      ctx.arc(player.x, player.y, player.r, 0, Math.PI*2);
+      ctx.fill();
+
+      // shield ring
+      if(player.shield>0 || safeT>0){
+        ctx.globalAlpha = (safeT>0) ? 0.55 : 0.35;
+        ctx.strokeStyle = "#5dffb3";
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, player.r+10, 0, Math.PI*2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
+      // magnet indicator
+      if(player.magnet>0){
+        ctx.globalAlpha = 0.18;
+        ctx.strokeStyle = "#66d9ff";
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, 220, 0, Math.PI*2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
+      // top banner text for powerups
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.font = "800 18px system-ui";
+      ctx.textAlign="center";
+      if(player.magnet>0) ctx.fillText("MEGA MAGNET", VW/2, 36);
+      else if(player.slow>0) ctx.fillText("SLOW-MO", VW/2, 36);
+      else if(player.shield>0) ctx.fillText("SHIELD", VW/2, 36);
+    }
+
+    function loop(ts){
+      const t = ts * 0.001;
+      const dt = Math.min(0.033, t - tPrev);
+      tPrev = t;
+
+      if(state === "playing"){
+        update(dt);
+      }
+      draw();
+
+      requestAnimationFrame(loop);
+    }
+
+    // ---------------------------
+    // Boot (Poki init + loading finished)
+    // ---------------------------
+    (async function boot(){
+      // Initialize Poki SDK (load game anyway if it fails). :contentReference[oaicite:10]{index=10}
+      try {
+        await Poki.init();
+      } catch {}
+      // If you have a loading screen, call this after assets are ready. :contentReference[oaicite:11]{index=11}
+      Poki.loaded();
+
+      // UI
+      $playBtn.addEventListener('click', () => startGameFlow());
+      state = "menu";
+      showMenuPanel();
+
+      requestAnimationFrame(loop);
+    })();
+
+  })();
+  </script>
+</body>
+</html>
